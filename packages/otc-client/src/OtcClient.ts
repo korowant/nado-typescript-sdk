@@ -1,12 +1,18 @@
 import { getNadoClientTypeHeaders } from '@nadohq/shared';
-import axios, { AxiosInstance } from 'axios';
+import axios, { AxiosInstance, AxiosResponse } from 'axios';
 import {
   OtcExecuteParams,
+  OtcGetAuthNonceParams,
   OtcGetExecutionStatusParams,
   OtcGetReadyParams,
   OtcReadyResult,
+  OtcVerifyAuthParams,
 } from './types/clientTypes';
-import { OtcServerExecutionResponse } from './types/serverTypes';
+import {
+  OtcServerAuthNonce,
+  OtcServerAuthSession,
+  OtcServerExecutionResponse,
+} from './types/serverTypes';
 
 export interface OtcClientOpts {
   /**
@@ -15,6 +21,11 @@ export interface OtcClientOpts {
   url: string;
   // If provided, identifies the calling client, sent as a header with every request
   clientType?: string;
+  /**
+   * Node clients only: sent as the `Origin` header, which the login routes require to be an
+   * approved web origin. Browsers set it themselves.
+   */
+  origin?: string;
 }
 
 /**
@@ -36,7 +47,32 @@ export class OtcClient {
     this.axiosInstance = axios.create({
       withCredentials: false,
       validateStatus: () => true,
-      headers: getNadoClientTypeHeaders(opts.clientType),
+      headers: {
+        ...getNadoClientTypeHeaders(opts.clientType),
+        ...(opts.origin ? { Origin: opts.origin } : {}),
+      },
+    });
+  }
+
+  /**
+   * Starts a private quote login for `sender`. Build the message with `buildOtcSiweMessage`,
+   * sign it, and pass it to {@link OtcClient.verifyAuth} within 60s. Throws on a non-200.
+   */
+  async getAuthNonce(
+    params: OtcGetAuthNonceParams,
+  ): Promise<OtcServerAuthNonce> {
+    return this.postAuth('/v1/auth/nonce', { sender: params.sender });
+  }
+
+  /**
+   * Completes a private quote login. On success the browser holds the session cookie; open a
+   * new quote socket afterwards, since a socket keeps the session it had at its handshake.
+   * Throws on a non-200; the message carries the service's `error` code.
+   */
+  async verifyAuth(params: OtcVerifyAuthParams): Promise<OtcServerAuthSession> {
+    return this.postAuth('/v1/auth/verify', {
+      message: params.message,
+      signature: params.signature,
     });
   }
 
@@ -75,6 +111,25 @@ export class OtcClient {
       httpStatus: response.status,
       ready: response.status === 200,
     };
+  }
+
+  /** The login routes need credentials. */
+  private async postAuth<T>(path: string, body: unknown): Promise<T> {
+    const response = await this.axiosInstance.post(
+      `${this.opts.url}${path}`,
+      body,
+      { withCredentials: true },
+    );
+    this.checkResponseStatus(response);
+    return response.data as T;
+  }
+
+  private checkResponseStatus(response: AxiosResponse) {
+    if (response.status !== 200 || !response.data) {
+      throw Error(
+        `Unexpected response from server: ${response.status} ${response.statusText}. Data: ${JSON.stringify(response.data)}`,
+      );
+    }
   }
 
   private async postExecution(
